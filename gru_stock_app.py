@@ -1,3 +1,7 @@
+"""
+GRU Stock Prediction GUI Application
+Enhanced with error handling and validation
+"""
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,6 +13,21 @@ from tkinter import ttk, messagebox
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from datetime import datetime
+import logging
+from pathlib import Path
+import re
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Device initialization
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {device}")
+
+# Directory setup
+MODELS_DIR = Path(__file__).parent / "models"
+MODELS_DIR.mkdir(exist_ok=True)
 
 # ---------- GRU Model ----------
 class GRUModel(nn.Module):
@@ -21,49 +40,154 @@ class GRUModel(nn.Module):
         out, _ = self.gru(x)
         return self.fc(out[:, -1, :])
 
+# Validation functions
+def validate_symbol(symbol):
+    if not symbol or not isinstance(symbol, str):
+        raise ValueError("Symbol must be a non-empty string")
+    symbol = symbol.strip().upper()
+    if not re.match(r'^[A-Z]{1,5}$', symbol):
+        raise ValueError(f"Invalid symbol format: {symbol}")
+    return symbol
+
+def validate_date(date_str):
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError("Invalid date format. Use YYYY-MM-DD")
+
 # ---------- Train Model ----------
 def train_model(symbol, start, end):
-    df = yf.download(symbol, start=start, end=end, progress=False)
-    df = df[['Close']].dropna()
-    scaler = MinMaxScaler()
-    data = scaler.fit_transform(df)
-    seq_len = 60
-    X, y = [], []
-    for i in range(len(data) - seq_len):
-        X.append(data[i:i+seq_len])
-        y.append(data[i+seq_len])
-    X = torch.tensor(np.array(X), dtype=torch.float32).view(-1, seq_len, 1).to(device)
-    y = torch.tensor(np.array(y), dtype=torch.float32).to(device)
-    model = GRUModel(1, 50, 2, 1).to(device)
-    criterion, optimizer = nn.MSELoss(), optim.Adam(model.parameters(), lr=0.001)
-    model.train()
-    for epoch in range(10):
-        optimizer.zero_grad()
-        out = model(X)
-        loss = criterion(out, y)
-        loss.backward(); optimizer.step()
-        print(f"{symbol} Train Epoch {epoch+1}: {loss.item():.6f}")
-    torch.save(model.state_dict(), f"{symbol}_gru_model.pth")
-    messagebox.showinfo("Training", f"Model saved for {symbol}")
+    """Train model with proper error handling."""
+    try:
+        symbol = validate_symbol(symbol)
+        start_date = validate_date(start)
+        end_date = validate_date(end)
+        
+        if not start_date or not end_date:
+            raise ValueError("Both start and end dates are required")
+        if start_date >= end_date:
+            raise ValueError("Start date must be before end date")
+        
+        logger.info(f"Training model for {symbol}")
+        
+        try:
+            df = yf.download(symbol, start=start, end=end, progress=False)
+        except Exception as e:
+            raise ValueError(f"Failed to download data: {e}")
+        
+        if df.empty or 'Close' not in df.columns:
+            raise ValueError(f"No data available for {symbol}")
+        
+        df = df[['Close']].dropna()
+        
+        if len(df) < 100:
+            raise ValueError(f"Not enough data. Need at least 100 data points, got {len(df)}")
+        
+        scaler = MinMaxScaler()
+        data = scaler.fit_transform(df)
+        seq_len = 60
+        
+        if len(data) < seq_len + 1:
+            raise ValueError(f"Not enough data for sequences. Need at least {seq_len + 1} points")
+        
+        X, y = [], []
+        for i in range(len(data) - seq_len):
+            X.append(data[i:i+seq_len])
+            y.append(data[i+seq_len])
+        
+        if len(X) == 0:
+            raise ValueError("No sequences generated")
+        
+        X = torch.tensor(np.array(X), dtype=torch.float32).view(-1, seq_len, 1).to(device)
+        y = torch.tensor(np.array(y), dtype=torch.float32).to(device)
+        
+        model = GRUModel(1, 50, 2, 1).to(device)
+        criterion, optimizer = nn.MSELoss(), optim.Adam(model.parameters(), lr=0.001)
+        
+        model.train()
+        for epoch in range(10):
+            optimizer.zero_grad()
+            out = model(X)
+            loss = criterion(out, y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            logger.info(f"{symbol} Train Epoch {epoch+1}: {loss.item():.6f}")
+        
+        model_path = MODELS_DIR / f"{symbol}_gru_model.pth"
+        torch.save(model.state_dict(), model_path)
+        logger.info(f"Model saved to {model_path}")
+        messagebox.showinfo("Training", f"Model saved for {symbol}")
+        
+    except Exception as e:
+        error_msg = f"Training failed: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        messagebox.showerror("Training Error", error_msg)
 
 # ---------- Predict Data ----------
 def get_predictions(symbol, start, end):
-    df = yf.download(symbol, start=start, end=end, progress=False)[['Close']].dropna()
-    if len(df) < 100:
-        raise ValueError("Not enough data")
-    scaler = MinMaxScaler()
-    data = scaler.fit_transform(df)
-    seq_len = 60
-    seqs = [data[i:i+seq_len] for i in range(len(data)-seq_len)]
-    X = torch.tensor(np.array(seqs), dtype=torch.float32).view(-1, seq_len, 1).to(device)
-    model = GRUModel(1,50,2,1).to(device)
-    model.load_state_dict(torch.load(f"{symbol}_gru_model.pth", map_location=device))
-    model.eval()
-    with torch.no_grad():
-        preds = model(X).cpu().numpy()
-    preds = scaler.inverse_transform(preds)
-    actual = df.values[seq_len:]
-    return actual.flatten(), preds.flatten()
+    """Get predictions with proper error handling."""
+    try:
+        symbol = validate_symbol(symbol)
+        validate_date(start)
+        validate_date(end)
+        
+        logger.info(f"Generating predictions for {symbol}")
+        
+        try:
+            df = yf.download(symbol, start=start, end=end, progress=False)
+        except Exception as e:
+            raise ValueError(f"Failed to download data: {e}")
+        
+        if df.empty or 'Close' not in df.columns:
+            raise ValueError(f"No data available for {symbol}")
+        
+        df = df[['Close']].dropna()
+        
+        if len(df) < 100:
+            raise ValueError(f"Not enough data. Need at least 100 data points, got {len(df)}")
+        
+        scaler = MinMaxScaler()
+        data = scaler.fit_transform(df)
+        seq_len = 60
+        
+        if len(data) < seq_len + 1:
+            raise ValueError(f"Not enough data for sequences")
+        
+        seqs = [data[i:i+seq_len] for i in range(len(data)-seq_len)]
+        
+        if len(seqs) == 0:
+            raise ValueError("No sequences generated")
+        
+        X = torch.tensor(np.array(seqs), dtype=torch.float32).view(-1, seq_len, 1).to(device)
+        
+        model = GRUModel(1, 50, 2, 1).to(device)
+        model_path = MODELS_DIR / f"{symbol}_gru_model.pth"
+        
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model for {symbol} not found. Please train the model first.")
+        
+        try:
+            model.load_state_dict(torch.load(model_path, map_location=device))
+        except Exception as e:
+            raise IOError(f"Failed to load model: {e}")
+        
+        model.eval()
+        with torch.no_grad():
+            preds = model(X).cpu().numpy()
+        
+        preds = scaler.inverse_transform(preds)
+        actual = df.values[seq_len:]
+        
+        logger.info(f"Successfully generated predictions for {symbol}")
+        return actual.flatten(), preds.flatten()
+        
+    except Exception as e:
+        error_msg = f"Prediction failed: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise ValueError(error_msg)
 
 # ---------- GUI with Dark Mode & Animation ----------
 def run_app():
@@ -113,19 +237,42 @@ def run_app():
     apply_theme()
 
     def on_predict():
-        symbol = combo.get().strip(); s=start_entry.get(); e=end_entry.get()
+        symbol = combo.get().strip()
+        s = start_entry.get().strip()
+        e = end_entry.get().strip()
+        
         if not symbol or not s or not e:
-            messagebox.showwarning("Missing", "Complete all inputs")
+            messagebox.showwarning("Missing Input", "Please complete all inputs")
             return
+        
+        try:
+            validate_symbol(symbol)
+            validate_date(s)
+            validate_date(e)
+        except ValueError as ve:
+            messagebox.showerror("Validation Error", str(ve))
+            return
+        
         # Stock Info
-        info=yf.Ticker(symbol).info
-        p=info.get('regularMarketPrice'); c=info.get('regularMarketChangePercent') or 0
-        stock_label.config(text=f"Price: ${p} | Change: {c:.2f}%")
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            p = info.get('regularMarketPrice') or info.get('currentPrice')
+            c = info.get('regularMarketChangePercent') or 0
+            if p:
+                stock_label.config(text=f"Price: ${p:.2f} | Change: {c:.2f}%")
+            else:
+                stock_label.config(text="Price information unavailable")
+        except Exception as e:
+            logger.warning(f"Failed to fetch stock info: {e}")
+            stock_label.config(text="Unable to fetch stock info")
+        
         # Get Data
         try:
             actual, pred = get_predictions(symbol, s, e)
         except Exception as ex:
-            messagebox.showerror("Error", str(ex)); return
+            messagebox.showerror("Prediction Error", str(ex))
+            return
         # Clear
         for w in graph_frame.winfo_children(): w.destroy()
         fig=plt.Figure(figsize=(8,5), dpi=100)
@@ -150,5 +297,10 @@ def run_app():
     root.mainloop()
 
 # Entry
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if __name__=="__main__": run_app()
+if __name__ == "__main__":
+    try:
+        logger.info("Starting Stock Prediction Application")
+        run_app()
+    except Exception as e:
+        logger.critical(f"Application failed to start: {e}", exc_info=True)
+        messagebox.showerror("Fatal Error", f"Application failed to start: {str(e)}")
