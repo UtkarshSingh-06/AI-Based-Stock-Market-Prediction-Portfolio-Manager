@@ -45,19 +45,74 @@ np.random.seed(RND_SEED)
 # Data utilities
 # ---------------------------
 def download_stock(symbol: str, start: str = "2008-01-01", end: Optional[str] = None,
-                   cache: bool = True) -> pd.DataFrame:
-    """Download (or load cached) OHLCV data for symbol."""
+                   cache: bool = True, retries: int = 3) -> pd.DataFrame:
+    """Download (or load cached) OHLCV data for symbol with retry logic."""
+    import time
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    
+    # Validate symbol
+    if not symbol or not isinstance(symbol, str):
+        raise ValueError("Symbol must be a non-empty string")
+    symbol = symbol.strip().upper()
+    
+    # Validate dates
+    try:
+        start_date = datetime.strptime(start, "%Y-%m-%d")
+        if start_date > datetime.now():
+            raise ValueError("Start date cannot be in the future")
+    except ValueError as e:
+        raise ValueError(f"Invalid start date format. Use YYYY-MM-DD: {e}")
+    
     if end is None:
         end = datetime.today().strftime("%Y-%m-%d")
-    csv_path = os.path.join(DATA_DIR, f"{symbol}.csv")
-    if cache and os.path.exists(csv_path):
-        df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
     else:
-        df = yf.download(symbol, start=start, end=end, progress=False)
-        df.to_csv(csv_path)
-    if "Close" not in df.columns:
-        raise ValueError("Downloaded data has no 'Close' column.")
-    return df
+        try:
+            end_date = datetime.strptime(end, "%Y-%m-%d")
+            if end_date > datetime.now():
+                raise ValueError("End date cannot be in the future")
+            if start_date >= end_date:
+                raise ValueError("Start date must be before end date")
+        except ValueError as e:
+            raise ValueError(f"Invalid end date: {e}")
+    
+    csv_path = os.path.join(DATA_DIR, f"{symbol}.csv")
+    
+    # Check cache
+    if cache and os.path.exists(csv_path):
+        try:
+            file_age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(csv_path))
+            if file_age.days < 1:  # Use cache if less than 1 day old
+                logger.info(f"Loading cached data for {symbol}")
+                df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+                if not df.empty and "Close" in df.columns:
+                    return df
+        except Exception as e:
+            logger.warning(f"Failed to load cache: {e}")
+    
+    # Download with retry
+    for attempt in range(retries):
+        try:
+            logger.info(f"Downloading {symbol} data (attempt {attempt+1}/{retries})")
+            df = yf.download(symbol, start=start, end=end, progress=False, threads=False)
+            if df.empty:
+                raise ValueError(f"No data returned for {symbol}")
+            if "Close" not in df.columns:
+                raise ValueError("Downloaded data has no 'Close' column.")
+            
+            # Save to cache
+            if cache:
+                df.to_csv(csv_path)
+                logger.info(f"Cached data for {symbol}")
+            
+            return df
+        except Exception as e:
+            logger.error(f"Download attempt {attempt+1} failed: {e}")
+            if attempt < retries - 1:
+                time.sleep(2 * (attempt + 1))  # Exponential backoff
+            else:
+                raise ValueError(f"Failed to download data for {symbol} after {retries} attempts: {e}")
 
 
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -68,17 +123,35 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["EMA_10"] = df["Close"].ewm(span=10, adjust=False).mean()
     df["STD_10"] = df["Close"].rolling(window=10).std()
     df["RET_1"] = df["Close"].pct_change().fillna(0)
-    df = df.fillna(method="bfill").fillna(method="ffill")
+    # Use modern fillna syntax (deprecated method removed)
+    df = df.bfill().ffill()
     return df
 
 
 def build_sequences(df: pd.DataFrame, feature_cols: List[str], seq_len: int = 60) -> Tuple[np.ndarray, np.ndarray]:
     """Turn feature DataFrame into sequences (X) and next-day target (y)."""
+    if len(df) < seq_len + 1:
+        raise ValueError(f"DataFrame too short. Need at least {seq_len + 1} rows, got {len(df)}")
+    
+    # Check all feature columns exist
+    missing_cols = [col for col in feature_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing feature columns: {missing_cols}")
+    
     arr = df[feature_cols].values
+    
+    # Check for NaN or inf values
+    if np.isnan(arr).any() or np.isinf(arr).any():
+        raise ValueError("Data contains NaN or Inf values. Please clean data first.")
+    
     sequences, targets = [], []
     for i in range(len(arr) - seq_len):
         sequences.append(arr[i:i + seq_len])
         targets.append(arr[i + seq_len][feature_cols.index("Close")])  # predict Close
+    
+    if len(sequences) == 0:
+        raise ValueError("No sequences generated from data")
+    
     return np.array(sequences, dtype=np.float32), np.array(targets, dtype=np.float32).reshape(-1, 1)
 
 
@@ -123,25 +196,66 @@ class GRUWithOptionalAttention(nn.Module):
 # Save / Load helpers
 # ---------------------------
 def save_model_and_scaler(symbol: str, model: nn.Module, scaler: MinMaxScaler):
+    """Save model and scaler with error handling."""
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    if not symbol or not isinstance(symbol, str):
+        raise ValueError("Symbol must be a non-empty string")
+    
+    symbol = symbol.strip().upper()
     path = os.path.join(MODELS_DIR, f"{symbol}_gru.pth")
     scaler_path = os.path.join(MODELS_DIR, f"{symbol}_scaler.pkl")
-    torch.save(model.state_dict(), path)
-    with open(scaler_path, "wb") as f:
-        pickle.dump(scaler, f)
+    
+    try:
+        torch.save(model.state_dict(), path)
+        logger.info(f"Saved model to {path}")
+    except Exception as e:
+        raise IOError(f"Failed to save model: {e}")
+    
+    try:
+        with open(scaler_path, "wb") as f:
+            pickle.dump(scaler, f)
+        logger.info(f"Saved scaler to {scaler_path}")
+    except Exception as e:
+        raise IOError(f"Failed to save scaler: {e}")
+    
     return path, scaler_path
 
 
 def load_model_and_scaler(symbol: str, input_size: int, use_attention: bool = False, map_location: str = "cpu"):
+    """Load model and scaler with proper error handling."""
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    if not symbol or not isinstance(symbol, str):
+        raise ValueError("Symbol must be a non-empty string")
+    
+    symbol = symbol.strip().upper()
     path = os.path.join(MODELS_DIR, f"{symbol}_gru.pth")
     scaler_path = os.path.join(MODELS_DIR, f"{symbol}_scaler.pkl")
-    if not os.path.exists(path) or not os.path.exists(scaler_path):
-        raise FileNotFoundError("Model or scaler file not found for symbol: " + symbol)
-    # build model (must match training config)
-    model = GRUWithOptionalAttention(input_size=input_size, use_attention=use_attention).to(device)
-    state = torch.load(path, map_location=map_location)
-    model.load_state_dict(state)
-    with open(scaler_path, "rb") as f:
-        scaler = pickle.load(f)
+    
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Model file not found for symbol: {symbol}. Path: {path}")
+    if not os.path.exists(scaler_path):
+        raise FileNotFoundError(f"Scaler file not found for symbol: {symbol}. Path: {scaler_path}")
+    
+    try:
+        # build model (must match training config)
+        model = GRUWithOptionalAttention(input_size=input_size, use_attention=use_attention).to(device)
+        state = torch.load(path, map_location=map_location)
+        model.load_state_dict(state)
+        logger.info(f"Loaded model for {symbol}")
+    except Exception as e:
+        raise IOError(f"Failed to load model for {symbol}: {e}")
+    
+    try:
+        with open(scaler_path, "rb") as f:
+            scaler = pickle.load(f)
+        logger.info(f"Loaded scaler for {symbol}")
+    except Exception as e:
+        raise IOError(f"Failed to load scaler for {symbol}: {e}")
+    
     model.eval()
     return model, scaler
 
@@ -169,10 +283,19 @@ def train(symbol: str,
     if len(X) < 10:
         raise ValueError("Not enough sequence data to train.")
 
-    # split train/val (simple)
+    # split train/val (simple) with validation
+    if len(X) < 20:
+        raise ValueError(f"Not enough data for train/val split. Need at least 20 sequences, got {len(X)}")
+    
     split = int(0.9 * len(X))
+    if split == 0:
+        split = max(1, len(X) - 1)  # Ensure at least 1 validation sample
+    
     X_train, y_train = X[:split], y[:split]
     X_val, y_val = X[split:], y[split:]
+    
+    if len(X_train) == 0 or len(X_val) == 0:
+        raise ValueError("Train/validation split resulted in empty sets")
 
     scaler = MinMaxScaler()
     # fit scaler on training features (reshape)
@@ -194,9 +317,16 @@ def train(symbol: str,
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
-    # training loop
+    # training loop with gradient clipping and early stopping
+    import logging
+    logger = logging.getLogger(__name__)
+    
     model.train()
     num_batches = max(1, int(np.ceil(len(X_tr) / batch_size)))
+    best_val_loss = float('inf')
+    patience = 5
+    patience_counter = 0
+    
     for epoch in range(epochs):
         perm = np.random.permutation(len(X_tr))
         epoch_loss = 0.0
@@ -207,16 +337,31 @@ def train(symbol: str,
             out = model(xb)
             loss = criterion(out, yb)
             loss.backward()
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             epoch_loss += loss.item()
+        
         # validation performance
         model.eval()
         with torch.no_grad():
             pred_val = model(X_val_t).cpu().numpy()
             val_rmse = math.sqrt(((y_val - pred_val) ** 2).mean())
             val_mape = (np.abs((y_val - pred_val) / (y_val + 1e-8)).mean()) * 100.0
+            val_loss = val_rmse  # Use RMSE as validation loss
+        
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info(f"Early stopping at epoch {epoch+1}")
+                break
+        
         model.train()
-        print(f"[{symbol}] Epoch {epoch+1}/{epochs} train_loss={(epoch_loss / num_batches):.6f} val_rmse={val_rmse:.4f} val_mape={val_mape:.2f}%")
+        logger.info(f"[{symbol}] Epoch {epoch+1}/{epochs} train_loss={(epoch_loss / num_batches):.6f} val_rmse={val_rmse:.4f} val_mape={val_mape:.2f}%")
 
     # save model + scaler
     model_path, scaler_path = "", ""
