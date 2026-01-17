@@ -1,3 +1,7 @@
+"""
+Simple GRU Stock Prediction GUI Application
+Enhanced with error handling and validation
+"""
 import torch
 import torch.nn as nn
 import numpy as np
@@ -8,6 +12,21 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import logging
+from pathlib import Path
+import os
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Device initialization
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {device}")
+
+# Directory setup
+MODELS_DIR = Path(__file__).parent / "models"
+MODELS_DIR.mkdir(exist_ok=True)
 
 # GRU model definition
 class GRUModel(nn.Module):
@@ -22,34 +41,70 @@ class GRUModel(nn.Module):
 
 # Prediction and visualization logic
 def predict_and_plot(symbol):
-    df = yf.download(symbol, start="2020-01-01", end="2024-04-01")
-    close_prices = df[['Close']]
-
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled_data = scaler.fit_transform(close_prices)
-
-    seq_length = 60
-    sequences = []
-    for i in range(len(scaled_data) - seq_length):
-        sequences.append(scaled_data[i:i+seq_length])
-
-    sequences = torch.tensor(np.array(sequences), dtype=torch.float32).to(device)
-
-    model = GRUModel(1, 50, 2, 1).to(device)
+    """Predict stock prices with proper error handling."""
     try:
-        model.load_state_dict(torch.load(f"{symbol}_gru_model.pth"))
-    except:
-        messagebox.showerror("Model Error", f"Model for {symbol} not found.")
+        symbol = symbol.strip().upper()
+        if not symbol:
+            raise ValueError("Symbol cannot be empty")
+        
+        logger.info(f"Predicting for {symbol}")
+        
+        # Download data with error handling
+        try:
+            df = yf.download(symbol, start="2020-01-01", end="2024-04-01", progress=False)
+        except Exception as e:
+            raise ValueError(f"Failed to download data: {e}")
+        
+        if df.empty or 'Close' not in df.columns:
+            raise ValueError(f"No data available for {symbol}")
+        
+        close_prices = df[['Close']].dropna()
+        
+        if len(close_prices) < 100:
+            raise ValueError(f"Not enough data for {symbol}. Need at least 100 data points.")
+
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        scaled_data = scaler.fit_transform(close_prices)
+
+        seq_length = 60
+        if len(scaled_data) < seq_length:
+            raise ValueError(f"Not enough data. Need at least {seq_length} data points.")
+        
+        sequences = []
+        for i in range(len(scaled_data) - seq_length):
+            sequences.append(scaled_data[i:i+seq_length])
+
+        if len(sequences) == 0:
+            raise ValueError("No sequences generated from data")
+
+        sequences = torch.tensor(np.array(sequences), dtype=torch.float32).to(device)
+
+        model = GRUModel(1, 50, 2, 1).to(device)
+        model_path = MODELS_DIR / f"{symbol}_gru_model.pth"
+        
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model for {symbol} not found at {model_path}")
+        
+        try:
+            model.load_state_dict(torch.load(model_path, map_location=device))
+        except Exception as e:
+            raise IOError(f"Failed to load model: {e}")
+
+        model.eval()
+        with torch.no_grad():
+            predictions = model(sequences.unsqueeze(-1)).cpu().numpy()
+
+        predictions = scaler.inverse_transform(predictions)
+        actual_prices = close_prices.values[seq_length:]
+
+        logger.info(f"Successfully generated predictions for {symbol}")
+        return actual_prices, predictions
+        
+    except Exception as e:
+        error_msg = f"Prediction error: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        messagebox.showerror("Prediction Error", error_msg)
         return None, None
-
-    model.eval()
-    with torch.no_grad():
-        predictions = model(sequences.unsqueeze(-1)).cpu().numpy()
-
-    predictions = scaler.inverse_transform(predictions)
-    actual_prices = close_prices.values[seq_length:]
-
-    return actual_prices, predictions
 
 # GUI App
 def run_app():
@@ -93,9 +148,11 @@ def run_app():
 
     root.mainloop()
 
-# Device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 # Run the app
 if __name__ == "__main__":
-    run_app()
+    try:
+        logger.info("Starting Stock Prediction Application")
+        run_app()
+    except Exception as e:
+        logger.critical(f"Application failed to start: {e}", exc_info=True)
+        messagebox.showerror("Fatal Error", f"Application failed to start: {str(e)}")
