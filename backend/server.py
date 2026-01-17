@@ -234,6 +234,41 @@ async def get_stock_info(symbol: str):
         logger.error(f"Error fetching stock info for {symbol}: {e}")
         raise HTTPException(status_code=404, detail=f"Stock {symbol} not found: {str(e)}")
 
+@app.post("/api/train/batch")
+async def batch_train_models(symbols: List[str], start_date: str = "2018-01-01",
+                            end_date: Optional[str] = None, epochs: int = 10,
+                            background_tasks: BackgroundTasks = None):
+    """Train multiple stock models in batch."""
+    try:
+        from batch_trainer import batch_train_stocks
+        
+        def train_background():
+            try:
+                results = batch_train_stocks(
+                    symbols=symbols,
+                    start=start_date,
+                    end=end_date,
+                    epochs=epochs,
+                    parallel=True,
+                    max_workers=3
+                )
+                logger.info(f"Batch training completed: {results}")
+            except Exception as e:
+                logger.error(f"Batch training error: {e}", exc_info=True)
+        
+        if background_tasks:
+            background_tasks.add_task(train_background)
+        
+        return {
+            "message": f"Batch training started for {len(symbols)} stocks",
+            "symbols": symbols,
+            "status": "training_in_progress"
+        }
+    except Exception as e:
+        logger.error(f"Batch train endpoint error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/train")
 async def train_model(request: TrainRequest, background_tasks: BackgroundTasks):
     """Train a GRU model for the specified stock"""
@@ -366,12 +401,35 @@ async def get_prediction_history(symbol: str, limit: int = 10):
 
 @app.get("/api/models")
 async def get_trained_models():
-    """Get list of all trained models"""
+    """Get list of all trained models from registry"""
+    try:
+        from batch_trainer import get_trained_models, get_model_info
+        
+        # Try to get from registry first
+        trained_symbols = get_trained_models()
+        models = []
+        
+        for symbol in trained_symbols:
+            info = get_model_info(symbol)
+            if info:
+                models.append({
+                    "symbol": symbol,
+                    "path": info.get("model_path", ""),
+                    "trained_at": info.get("trained_at", ""),
+                    "metadata": info.get("metadata", {})
+                })
+        
+        if models:
+            return {"models": models, "total": len(models), "source": "registry"}
+    except Exception as e:
+        logger.warning(f"Failed to load from registry: {e}")
+    
+    # Fallback to file system scan
     import glob
     models_dir = BASE_DIR / "models"
     
     if not models_dir.exists():
-        return {"models": [], "total": 0}
+        return {"models": [], "total": 0, "source": "filesystem"}
     
     model_files = glob.glob(str(models_dir / "*_gru.pth"))
     models = []
@@ -387,7 +445,7 @@ async def get_trained_models():
         except Exception as e:
             logger.warning(f"Error processing model file {model_file}: {e}")
     
-    return {"models": models, "total": len(models)}
+    return {"models": models, "total": len(models), "source": "filesystem"}
 
 @app.get("/api/download/{symbol}")
 async def download_stock_data(symbol: str, start: str = "2018-01-01", end: Optional[str] = None):
