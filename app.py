@@ -172,7 +172,13 @@ def train_model(symbol, start, end, epochs=10, seq_len=60, hidden_size=50, num_l
         y = torch.tensor(np.array(y), dtype=torch.float32).to(device)
 
         model = GRUModel(1, hidden_size, num_layers, 1, dropout=0.2).to(device)
-        criterion = nn.MSELoss()
+        
+        # Use Huber loss for better robustness (falls back to MSE if not available)
+        try:
+            criterion = nn.HuberLoss(delta=1.0)
+        except:
+            criterion = nn.MSELoss()
+        
         optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
         model.train()
