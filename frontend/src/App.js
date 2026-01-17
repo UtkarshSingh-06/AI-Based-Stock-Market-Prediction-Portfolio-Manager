@@ -73,21 +73,35 @@ function App() {
     }
   }, [selectedStock]);
 
-  const fetchStocks = async () => {
-    try {
-      const response = await axios.get(`${API_URL}/api/stocks`);
-      setStocks(response.data.stocks);
-    } catch (err) {
-      setError('Failed to fetch stocks');
+  const fetchStocks = async (retries = 3) => {
+    for (let attempt = 0; attempt < retries; attempt++) {
+      try {
+        const response = await axios.get(`${API_URL}/api/stocks`, {
+          timeout: 10000
+        });
+        setStocks(response.data.stocks);
+        return;
+      } catch (err) {
+        if (attempt === retries - 1) {
+          setError('Failed to fetch stocks. Please check your connection.');
+          console.error('Failed to fetch stocks:', err);
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+        }
+      }
     }
   };
 
   const fetchStockInfo = async (symbol) => {
+    if (!symbol) return;
     try {
-      const response = await axios.get(`${API_URL}/api/stock/${symbol}`);
+      const response = await axios.get(`${API_URL}/api/stock/${symbol}`, {
+        timeout: 10000
+      });
       setStockInfo(response.data);
     } catch (err) {
       console.error('Failed to fetch stock info', err);
+      setStockInfo(null);
     }
   };
 
@@ -108,6 +122,7 @@ function App() {
 
     setLoading(true);
     setError('');
+    setSuccess('');
     setPredictions(null);
 
     try {
@@ -116,13 +131,17 @@ function App() {
         start_date: startDate,
         end_date: endDate || undefined,
         seq_len: 60
+      }, {
+        timeout: 60000  // 60 second timeout for predictions
       });
 
       setPredictions(response.data);
       setSuccess('Predictions generated successfully!');
       setTimeout(() => setSuccess(''), 3000);
     } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to generate predictions. Train the model first.');
+      const errorMsg = err.response?.data?.detail || err.message || 'Failed to generate predictions. Train the model first.';
+      setError(errorMsg);
+      console.error('Prediction error:', err);
     } finally {
       setLoading(false);
     }
@@ -136,6 +155,7 @@ function App() {
 
     setTraining(true);
     setError('');
+    setSuccess('');
 
     try {
       await axios.post(`${API_URL}/api/train`, {
@@ -144,6 +164,8 @@ function App() {
         end_date: endDate || undefined,
         epochs: 10,
         seq_len: 60
+      }, {
+        timeout: 10000  // 10 second timeout for starting training
       });
 
       setSuccess(`Training started for ${selectedStock}. This will take a few minutes...`);
@@ -152,7 +174,9 @@ function App() {
         fetchTrainedModels();
       }, 5000);
     } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to start training');
+      const errorMsg = err.response?.data?.detail || err.message || 'Failed to start training';
+      setError(errorMsg);
+      console.error('Training error:', err);
     } finally {
       setTraining(false);
     }
@@ -300,7 +324,7 @@ function App() {
           </div>
         )}
 
-        <div style={{ display: 'grid', gridTemplateColumns: window.innerWidth >= 1024 ? 'minmax(350px, 1fr) 2fr' : '1fr', gap: '1.5rem' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(350px, 1fr))', gap: '1.5rem' }}>
           {/* Left Panel */}
           <div>
             {stockInfo && (
