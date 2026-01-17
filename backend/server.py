@@ -1,35 +1,69 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, validator
 from typing import Optional, List
 import os
+import sys
 from datetime import datetime
 import uvicorn
+import logging
+from pathlib import Path
 
-# Import existing predictor utilities
-import sys
-sys.path.append('/app')
-from predictor import train, predict, compute_rmse, compute_mape, download_stock
+# Add parent directory to path for imports
+BASE_DIR = Path(__file__).parent.parent
+sys.path.insert(0, str(BASE_DIR))
+
+try:
+    from predictor import train, predict, compute_rmse, compute_mape, download_stock
+except ImportError as e:
+    logging.error(f"Failed to import predictor: {e}")
+    raise
 
 from motor.motor_asyncio import AsyncIOMotorClient
 import yfinance as yf
 import numpy as np
+import re
 
-app = FastAPI(title="Stock Prediction API")
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# CORS Configuration
+app = FastAPI(title="Stock Prediction API", version="1.0.0")
+
+# CORS Configuration - More secure defaults
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'http://localhost:3000,http://localhost:3001').split(',')
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
-# MongoDB Configuration
+# MongoDB Configuration with connection pooling
 MONGO_URL = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
-client = AsyncIOMotorClient(MONGO_URL)
-db = client.stock_prediction
+try:
+    client = AsyncIOMotorClient(
+        MONGO_URL,
+        maxPoolSize=10,
+        minPoolSize=1,
+        serverSelectionTimeoutMS=5000
+    )
+    db = client.stock_prediction
+    logger.info("MongoDB connection initialized")
+except Exception as e:
+    logger.error(f"MongoDB connection failed: {e}")
+    db = None  # Allow app to run without MongoDB
+
+# Cleanup on shutdown
+@app.on_event("shutdown")
+async def shutdown_event():
+    if client:
+        client.close()
+        logger.info("MongoDB connection closed")
 
 # Available stocks - Expanded list (30+ stocks)
 AVAILABLE_STOCKS = [
@@ -80,19 +114,62 @@ AVAILABLE_STOCKS = [
     {"symbol": "PEP", "name": "PepsiCo Inc.", "sector": "Beverages"},
 ]
 
-# Pydantic Models
+# Validation functions
+def validate_symbol(symbol: str) -> str:
+    """Validate stock symbol format."""
+    if not symbol or not isinstance(symbol, str):
+        raise ValueError("Symbol must be a non-empty string")
+    symbol = symbol.strip().upper()
+    if not re.match(r'^[A-Z]{1,5}$', symbol):
+        raise ValueError(f"Invalid symbol format: {symbol}")
+    return symbol
+
+def validate_date(date_str: str) -> datetime:
+    """Validate date string."""
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f"Invalid date format. Use YYYY-MM-DD")
+
+# Pydantic Models with validation
 class TrainRequest(BaseModel):
-    symbol: str
+    symbol: str = Field(..., min_length=1, max_length=5)
     start_date: str = "2018-01-01"
     end_date: Optional[str] = None
-    epochs: int = 10
-    seq_len: int = 60
+    epochs: int = Field(10, ge=1, le=100)
+    seq_len: int = Field(60, ge=10, le=200)
+    
+    @validator('symbol')
+    def validate_symbol(cls, v):
+        return validate_symbol(v)
+    
+    @validator('start_date', 'end_date')
+    def validate_dates(cls, v, values):
+        if v:
+            date_obj = validate_date(v)
+            if date_obj > datetime.now():
+                raise ValueError("Date cannot be in the future")
+            if 'start_date' in values and values.get('start_date'):
+                start = validate_date(values['start_date'])
+                if date_obj <= start:
+                    raise ValueError("End date must be after start date")
+        return v
 
 class PredictRequest(BaseModel):
-    symbol: str
+    symbol: str = Field(..., min_length=1, max_length=5)
     start_date: str = "2018-01-01"
     end_date: Optional[str] = None
-    seq_len: int = 60
+    seq_len: int = Field(60, ge=10, le=200)
+    
+    @validator('symbol')
+    def validate_symbol(cls, v):
+        return validate_symbol(v)
+    
+    @validator('start_date', 'end_date')
+    def validate_dates(cls, v):
+        if v:
+            validate_date(v)
+        return v
 
 class StockInfo(BaseModel):
     symbol: str
@@ -118,8 +195,13 @@ async def get_stocks():
             stock_info["current_price"] = info.get('regularMarketPrice') or info.get('currentPrice')
             stock_info["change_percent"] = info.get('regularMarketChangePercent')
             stocks_with_info.append(stock_info)
-        except:
-            stocks_with_info.append(stock)
+        except Exception as e:
+            logger.warning(f"Failed to fetch info for {stock['symbol']}: {e}")
+            # Add stock without price info
+            stock_info = stock.copy()
+            stock_info["current_price"] = None
+            stock_info["change_percent"] = None
+            stocks_with_info.append(stock_info)
     
     return {"stocks": stocks_with_info, "total": len(stocks_with_info)}
 
@@ -127,8 +209,12 @@ async def get_stocks():
 async def get_stock_info(symbol: str):
     """Get detailed information about a specific stock"""
     try:
+        symbol = validate_symbol(symbol)
         ticker = yf.Ticker(symbol)
         info = ticker.info
+        
+        if not info or 'symbol' not in info:
+            raise HTTPException(status_code=404, detail=f"Stock {symbol} not found")
         
         stock_data = {
             "symbol": symbol,
@@ -142,7 +228,10 @@ async def get_stock_info(symbol: str):
             "low_52week": info.get('fiftyTwoWeekLow'),
         }
         return stock_data
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.error(f"Error fetching stock info for {symbol}: {e}")
         raise HTTPException(status_code=404, detail=f"Stock {symbol} not found: {str(e)}")
 
 @app.post("/api/train")
@@ -152,11 +241,15 @@ async def train_model(request: TrainRequest, background_tasks: BackgroundTasks):
         # Validate stock symbol
         valid_symbols = [s["symbol"] for s in AVAILABLE_STOCKS]
         if request.symbol not in valid_symbols:
-            raise HTTPException(status_code=400, detail=f"Invalid stock symbol. Choose from: {valid_symbols}")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid stock symbol. Choose from: {valid_symbols}"
+            )
         
         # Start training in background
         def train_background():
             try:
+                logger.info(f"Starting training for {request.symbol}")
                 model_path, scaler_path = train(
                     symbol=request.symbol,
                     start=request.start_date,
@@ -166,16 +259,28 @@ async def train_model(request: TrainRequest, background_tasks: BackgroundTasks):
                     save=True
                 )
                 # Save training log to database
-                db.training_logs.insert_one({
-                    "symbol": request.symbol,
-                    "start_date": request.start_date,
-                    "end_date": request.end_date or datetime.now().strftime("%Y-%m-%d"),
-                    "epochs": request.epochs,
-                    "model_path": model_path,
-                    "trained_at": datetime.now()
-                })
+                if db:
+                    try:
+                        import asyncio
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(
+                            db.training_logs.insert_one({
+                                "symbol": request.symbol,
+                                "start_date": request.start_date,
+                                "end_date": request.end_date or datetime.now().strftime("%Y-%m-%d"),
+                                "epochs": request.epochs,
+                                "model_path": model_path,
+                                "trained_at": datetime.now()
+                            })
+                        )
+                        loop.close()
+                    except Exception as db_error:
+                        logger.error(f"Failed to save training log: {db_error}")
+                
+                logger.info(f"Training completed for {request.symbol}")
             except Exception as e:
-                print(f"Training error: {e}")
+                logger.error(f"Training error for {request.symbol}: {e}", exc_info=True)
         
         background_tasks.add_task(train_background)
         
@@ -185,8 +290,11 @@ async def train_model(request: TrainRequest, background_tasks: BackgroundTasks):
             "epochs": request.epochs,
             "status": "training_in_progress"
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Train endpoint error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/api/predict")
 async def predict_stock(request: PredictRequest):
@@ -260,20 +368,24 @@ async def get_prediction_history(symbol: str, limit: int = 10):
 async def get_trained_models():
     """Get list of all trained models"""
     import glob
-    models_dir = "/app/models"
-    if not os.path.exists(models_dir):
-        return {"models": []}
+    models_dir = BASE_DIR / "models"
     
-    model_files = glob.glob(os.path.join(models_dir, "*_gru.pth"))
+    if not models_dir.exists():
+        return {"models": [], "total": 0}
+    
+    model_files = glob.glob(str(models_dir / "*_gru.pth"))
     models = []
     
     for model_file in model_files:
-        symbol = os.path.basename(model_file).replace("_gru.pth", "")
-        models.append({
-            "symbol": symbol,
-            "path": model_file,
-            "last_modified": datetime.fromtimestamp(os.path.getmtime(model_file)).isoformat()
-        })
+        try:
+            symbol = os.path.basename(model_file).replace("_gru.pth", "")
+            models.append({
+                "symbol": symbol,
+                "path": model_file,
+                "last_modified": datetime.fromtimestamp(os.path.getmtime(model_file)).isoformat()
+            })
+        except Exception as e:
+            logger.warning(f"Error processing model file {model_file}: {e}")
     
     return {"models": models, "total": len(models)}
 
@@ -298,4 +410,7 @@ async def download_stock_data(symbol: str, start: str = "2018-01-01", end: Optio
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    port = int(os.environ.get('PORT', 8001))
+    host = os.environ.get('HOST', '0.0.0.0')
+    logger.info(f"Starting server on {host}:{port}")
+    uvicorn.run(app, host=host, port=port, log_level="info")
