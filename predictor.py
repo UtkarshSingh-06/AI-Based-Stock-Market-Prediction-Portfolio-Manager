@@ -116,15 +116,69 @@ def download_stock(symbol: str, start: str = "2008-01-01", end: Optional[str] = 
 
 
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Add a few simple technical indicators used as features."""
+    """Add comprehensive technical indicators used as features."""
     df = df.copy()
+    
+    # Moving Averages
     df["MA_5"] = df["Close"].rolling(window=5).mean()
     df["MA_10"] = df["Close"].rolling(window=10).mean()
+    df["MA_20"] = df["Close"].rolling(window=20).mean()
+    df["MA_50"] = df["Close"].rolling(window=50).mean()
+    
+    # Exponential Moving Averages
     df["EMA_10"] = df["Close"].ewm(span=10, adjust=False).mean()
+    df["EMA_20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    
+    # Volatility
     df["STD_10"] = df["Close"].rolling(window=10).std()
+    df["STD_20"] = df["Close"].rolling(window=20).std()
+    
+    # Returns
     df["RET_1"] = df["Close"].pct_change().fillna(0)
-    # Use modern fillna syntax (deprecated method removed)
+    df["RET_5"] = df["Close"].pct_change(periods=5).fillna(0)
+    
+    # RSI (Relative Strength Index)
+    delta = df["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / (loss + 1e-10)
+    df["RSI"] = 100 - (100 / (1 + rs))
+    
+    # MACD (Moving Average Convergence Divergence)
+    ema_12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema_26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema_12 - ema_26
+    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
+    
+    # Bollinger Bands
+    bb_period = 20
+    bb_std = 2
+    df["BB_Middle"] = df["Close"].rolling(window=bb_period).mean()
+    bb_std_val = df["Close"].rolling(window=bb_period).std()
+    df["BB_Upper"] = df["BB_Middle"] + (bb_std * bb_std_val)
+    df["BB_Lower"] = df["BB_Middle"] - (bb_std * bb_std_val)
+    df["BB_Width"] = df["BB_Upper"] - df["BB_Lower"]
+    df["BB_Position"] = (df["Close"] - df["BB_Lower"]) / (df["BB_Width"] + 1e-10)
+    
+    # Volume indicators (if Volume column exists)
+    if "Volume" in df.columns:
+        df["Volume_MA"] = df["Volume"].rolling(window=20).mean()
+        df["Volume_Ratio"] = df["Volume"] / (df["Volume_MA"] + 1e-10)
+        df["Price_Volume"] = df["Close"] * df["Volume"]
+    
+    # High-Low indicators
+    if "High" in df.columns and "Low" in df.columns:
+        df["HL_Range"] = df["High"] - df["Low"]
+        df["HL_Pct"] = df["HL_Range"] / (df["Close"] + 1e-10)
+        df["Body"] = abs(df["Close"] - df["Open"]) if "Open" in df.columns else 0
+    
+    # Fill NaN values
     df = df.bfill().ffill()
+    
+    # Replace any remaining inf or NaN with 0
+    df = df.replace([np.inf, -np.inf], 0).fillna(0)
+    
     return df
 
 
@@ -173,7 +227,86 @@ class Attention(nn.Module):
         return context, alpha
 
 
+class EnhancedGRUModel(nn.Module):
+    """Enhanced GRU model with bidirectional option, layer normalization, and residual connections."""
+    def __init__(self, input_size: int, hidden_size: int = 50, num_layers: int = 2,
+                 dropout: float = 0.2, use_attention: bool = False, bidirectional: bool = False,
+                 use_layer_norm: bool = True, use_residual: bool = False):
+        super().__init__()
+        self.use_attention = use_attention
+        self.use_residual = use_residual
+        self.bidirectional = bidirectional
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        # GRU layer
+        self.gru = nn.GRU(
+            input_size, 
+            hidden_size, 
+            num_layers, 
+            batch_first=True, 
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional
+        )
+        
+        # Layer normalization
+        if use_layer_norm:
+            gru_output_size = hidden_size * 2 if bidirectional else hidden_size
+            self.layer_norm = nn.LayerNorm(gru_output_size)
+        else:
+            self.layer_norm = None
+        
+        # Attention mechanism
+        if use_attention:
+            gru_output_size = hidden_size * 2 if bidirectional else hidden_size
+            self.att = Attention(gru_output_size)
+        else:
+            self.att = None
+        
+        # Fully connected layers with dropout
+        gru_output_size = hidden_size * 2 if bidirectional else hidden_size
+        self.fc1 = nn.Linear(gru_output_size, hidden_size)
+        self.dropout_layer = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_size, 1)
+        self.activation = nn.ReLU()
+        
+        # Residual connection (if input and output sizes match)
+        if use_residual and input_size == 1:
+            self.residual_proj = nn.Linear(input_size, 1)
+        else:
+            self.residual_proj = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, features)
+        gru_out, _ = self.gru(x)  # out: (batch, seq_len, hidden)
+        
+        # Apply layer normalization
+        if self.layer_norm is not None:
+            gru_out = self.layer_norm(gru_out)
+        
+        # Attention or last timestep
+        if self.use_attention and self.att is not None:
+            context, _ = self.att(gru_out)
+            out = context
+        else:
+            out = gru_out[:, -1, :]  # last timestep
+        
+        # Fully connected layers
+        out = self.fc1(out)
+        out = self.activation(out)
+        out = self.dropout_layer(out)
+        out = self.fc2(out)
+        
+        # Residual connection (if applicable)
+        if self.use_residual and self.residual_proj is not None:
+            residual = self.residual_proj(x[:, -1, :])  # last timestep of input
+            out = out + residual
+        
+        return out
+
+
 class GRUWithOptionalAttention(nn.Module):
+    """Original GRU model for backward compatibility."""
     def __init__(self, input_size: int, hidden_size: int = 50, num_layers: int = 2,
                  dropout: float = 0.0, use_attention: bool = False):
         super().__init__()
@@ -223,8 +356,9 @@ def save_model_and_scaler(symbol: str, model: nn.Module, scaler: MinMaxScaler):
     return path, scaler_path
 
 
-def load_model_and_scaler(symbol: str, input_size: int, use_attention: bool = False, map_location: str = "cpu"):
-    """Load model and scaler with proper error handling."""
+def load_model_and_scaler(symbol: str, input_size: int, use_attention: bool = False, 
+                          map_location: str = "cpu", use_enhanced: bool = True):
+    """Load model and scaler with proper error handling. Tries enhanced model first."""
     import logging
     logger = logging.getLogger(__name__)
     
@@ -241,11 +375,34 @@ def load_model_and_scaler(symbol: str, input_size: int, use_attention: bool = Fa
         raise FileNotFoundError(f"Scaler file not found for symbol: {symbol}. Path: {scaler_path}")
     
     try:
-        # build model (must match training config)
-        model = GRUWithOptionalAttention(input_size=input_size, use_attention=use_attention).to(device)
-        state = torch.load(path, map_location=map_location)
-        model.load_state_dict(state)
-        logger.info(f"Loaded model for {symbol}")
+        # Try enhanced model first
+        if use_enhanced:
+            try:
+                model = EnhancedGRUModel(
+                    input_size=input_size,
+                    hidden_size=50,
+                    num_layers=2,
+                    dropout=0.2,
+                    use_attention=use_attention,
+                    bidirectional=False,
+                    use_layer_norm=True,
+                    use_residual=False
+                ).to(device)
+                state = torch.load(path, map_location=map_location)
+                model.load_state_dict(state, strict=False)  # Allow partial loading
+                logger.info(f"Loaded enhanced model for {symbol}")
+            except Exception:
+                # Fallback to original model
+                logger.info(f"Enhanced model failed, using original model for {symbol}")
+                model = GRUWithOptionalAttention(input_size=input_size, use_attention=use_attention).to(device)
+                state = torch.load(path, map_location=map_location)
+                model.load_state_dict(state)
+        else:
+            # Use original model
+            model = GRUWithOptionalAttention(input_size=input_size, use_attention=use_attention).to(device)
+            state = torch.load(path, map_location=map_location)
+            model.load_state_dict(state)
+            logger.info(f"Loaded original model for {symbol}")
     except Exception as e:
         raise IOError(f"Failed to load model for {symbol}: {e}")
     
@@ -278,7 +435,27 @@ def train(symbol: str,
     """
     df = download_stock(symbol, start=start, end=end, cache=True)
     df = add_technical_indicators(df)
-    feature_cols = ["Close", "MA_5", "MA_10", "EMA_10", "STD_10", "RET_1"]
+    
+    # Use enhanced feature set if available
+    basic_features = ["Close", "MA_5", "MA_10", "EMA_10", "STD_10", "RET_1"]
+    enhanced_features = ["Close", "MA_5", "MA_10", "MA_20", "EMA_10", "EMA_20", 
+                        "STD_10", "STD_20", "RET_1", "RET_5", "RSI", "MACD", 
+                        "MACD_Signal", "BB_Position", "BB_Width"]
+    
+    # Check which features are available
+    available_features = [f for f in enhanced_features if f in df.columns]
+    if len(available_features) < len(basic_features):
+        feature_cols = [f for f in basic_features if f in df.columns]
+    else:
+        feature_cols = available_features
+    
+    # Ensure Close is always first
+    if "Close" not in feature_cols:
+        feature_cols.insert(0, "Close")
+    elif feature_cols[0] != "Close":
+        feature_cols.remove("Close")
+        feature_cols.insert(0, "Close")
+    
     X, y = build_sequences(df, feature_cols, seq_len=seq_len)
     if len(X) < 10:
         raise ValueError("Not enough sequence data to train.")
@@ -311,11 +488,28 @@ def train(symbol: str,
     X_val_t = torch.tensor(X_val_scaled, dtype=torch.float32).to(device)
     y_val_t = torch.tensor(y_val, dtype=torch.float32).to(device)
 
-    # model
+    # model - use enhanced model if available, fallback to original
     input_size = X_tr.shape[-1]
-    model = GRUWithOptionalAttention(input_size=input_size, use_attention=use_attention).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
+    use_enhanced = True  # Set to False to use original model
+    
+    if use_enhanced:
+        model = EnhancedGRUModel(
+            input_size=input_size, 
+            hidden_size=hidden_size if 'hidden_size' in locals() else 50,
+            num_layers=num_layers if 'num_layers' in locals() else 2,
+            dropout=0.2,
+            use_attention=use_attention,
+            bidirectional=False,  # Can be enabled for better performance
+            use_layer_norm=True,
+            use_residual=False
+        ).to(device)
+    else:
+        model = GRUWithOptionalAttention(input_size=input_size, use_attention=use_attention).to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    
+    # Use Huber loss for robustness (less sensitive to outliers than MSE)
+    criterion = nn.HuberLoss(delta=1.0)  # Can fallback to MSELoss() if needed
 
     # training loop with gradient clipping and early stopping
     import logging
@@ -372,6 +566,65 @@ def train(symbol: str,
     return model_path, scaler_path
 
 
+def predict_future(symbol: str,
+                   days_ahead: int = 30,
+                   seq_len: int = 60,
+                   use_attention: bool = False,
+                   use_enhanced: bool = True) -> np.ndarray:
+    """
+    Predict future stock prices for N days ahead.
+    Returns array of predicted prices.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # Get recent data
+    df = download_stock(symbol, start=None, end=None, cache=True)
+    df = add_technical_indicators(df)
+    feature_cols = ["Close", "MA_5", "MA_10", "EMA_10", "STD_10", "RET_1"]
+    
+    # Load model and scaler
+    model, scaler = load_model_and_scaler(symbol, input_size=len(feature_cols), 
+                                          use_attention=use_attention, map_location=device)
+    
+    predictions = []
+    current_data = df[feature_cols].tail(seq_len).values
+    
+    model.eval()
+    with torch.no_grad():
+        for day in range(days_ahead):
+            # Scale current sequence
+            current_scaled = scaler.transform(current_data)
+            X_t = torch.tensor(current_scaled, dtype=torch.float32).unsqueeze(0).to(device)
+            
+            # Predict next day
+            pred_scaled = model(X_t).cpu().numpy()
+            
+            # Inverse transform only the Close price (first feature)
+            # Create dummy array for inverse transform
+            dummy = np.zeros((1, len(feature_cols)))
+            dummy[0, 0] = pred_scaled[0, 0]  # Close price
+            pred = scaler.inverse_transform(dummy)[0, 0]
+            predictions.append(pred)
+            
+            # Update current_data with prediction (for next iteration)
+            # Create new row with predicted close
+            new_row = current_data[-1].copy()
+            new_row[0] = pred  # Update Close
+            # Update other features (simplified - could be more sophisticated)
+            new_row[1] = np.mean([current_data[-4:, 0].mean(), pred])  # MA_5 approximation
+            new_row[2] = np.mean([current_data[-9:, 0].mean(), pred])  # MA_10 approximation
+            new_row[3] = 0.9 * new_row[3] + 0.1 * pred  # EMA_10 approximation
+            new_row[4] = current_data[-10:, 0].std()  # STD_10
+            new_row[5] = (pred - current_data[-1, 0]) / (current_data[-1, 0] + 1e-10)  # RET_1
+            
+            # Shift window
+            current_data = np.vstack([current_data[1:], new_row.reshape(1, -1)])
+    
+    logger.info(f"Generated {days_ahead} future predictions for {symbol}")
+    return np.array(predictions)
+
+
 def predict(symbol: str,
             start: str = "2008-01-01",
             end: Optional[str] = None,
@@ -389,8 +642,18 @@ def predict(symbol: str,
     if len(X) == 0:
         raise ValueError("Not enough data to produce sequences for prediction.")
 
-    # load model + scaler
-    model, scaler = load_model_and_scaler(symbol, input_size=X.shape[-1], use_attention=use_attention, map_location=device)
+    # load model + scaler (try enhanced model first, fallback to original)
+    try:
+        # Try to load enhanced model
+        model, scaler = load_model_and_scaler(symbol, input_size=X.shape[-1], 
+                                              use_attention=use_attention, map_location=device)
+    except Exception as e:
+        # Fallback to original model loading
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Failed to load model, trying original format: {e}")
+        model, scaler = load_model_and_scaler(symbol, input_size=X.shape[-1], 
+                                              use_attention=False, map_location=device)
     # scale all sequences
     flat = X.reshape(-1, X.shape[-1])
     flat_scaled = scaler.transform(flat)
@@ -410,6 +673,16 @@ def predict(symbol: str,
 
 
 # ---------------------------
+# Ensemble prediction
+# ---------------------------
+def ensemble_predict_models(symbol: str, models: List[nn.Module], X: torch.Tensor,
+                            method: str = 'mean') -> np.ndarray:
+    """Make ensemble predictions from multiple models."""
+    from model_utils import ensemble_predict
+    return ensemble_predict(models, X, method)
+
+
+# ---------------------------
 # Metrics helpers
 # ---------------------------
 def compute_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -418,6 +691,20 @@ def compute_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def compute_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float((np.abs((y_true - y_pred) / (y_true + 1e-8))).mean() * 100.0)
+
+
+def compute_mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Mean Absolute Error"""
+    return float(np.abs(y_true - y_pred).mean())
+
+
+def compute_r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """R-squared score"""
+    ss_res = ((y_true - y_pred) ** 2).sum()
+    ss_tot = ((y_true - y_true.mean()) ** 2).sum()
+    if ss_tot == 0:
+        return 0.0
+    return float(1 - (ss_res / ss_tot))
 
 
 # ---------------------------
