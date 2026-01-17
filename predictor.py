@@ -11,7 +11,7 @@ Provides:
 - Predict and evaluation helpers
 """
 
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
 import os
 import math
 import pickle
@@ -328,8 +328,9 @@ class GRUWithOptionalAttention(nn.Module):
 # ---------------------------
 # Save / Load helpers
 # ---------------------------
-def save_model_and_scaler(symbol: str, model: nn.Module, scaler: MinMaxScaler):
-    """Save model and scaler with error handling."""
+def save_model_and_scaler(symbol: str, model: nn.Module, scaler: MinMaxScaler, 
+                         metadata: Optional[Dict] = None):
+    """Save model and scaler with error handling and metadata."""
     import logging
     logger = logging.getLogger(__name__)
     
@@ -339,6 +340,7 @@ def save_model_and_scaler(symbol: str, model: nn.Module, scaler: MinMaxScaler):
     symbol = symbol.strip().upper()
     path = os.path.join(MODELS_DIR, f"{symbol}_gru.pth")
     scaler_path = os.path.join(MODELS_DIR, f"{symbol}_scaler.pkl")
+    metadata_path = os.path.join(MODELS_DIR, f"{symbol}_metadata.json")
     
     try:
         torch.save(model.state_dict(), path)
@@ -352,6 +354,16 @@ def save_model_and_scaler(symbol: str, model: nn.Module, scaler: MinMaxScaler):
         logger.info(f"Saved scaler to {scaler_path}")
     except Exception as e:
         raise IOError(f"Failed to save scaler: {e}")
+    
+    # Save metadata if provided
+    if metadata:
+        try:
+            import json
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2, default=str)
+            logger.info(f"Saved metadata to {metadata_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save metadata: {e}")
     
     return path, scaler_path
 
