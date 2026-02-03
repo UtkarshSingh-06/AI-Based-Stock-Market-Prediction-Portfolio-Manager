@@ -116,6 +116,9 @@ class Prediction(Base):
     model_version = Column(String)
     accuracy_score = Column(Float, nullable=True)
     metadata = Column(JSON)
+    passport = Column(JSON, nullable=True)  # model_version, feature_set, data_start, data_end, regime
+    abstained = Column(Boolean, default=False)
+    abstention_reason = Column(String(100), nullable=True)
 
 class ModelMetrics(Base):
     __tablename__ = "model_metrics"
@@ -142,6 +145,81 @@ class AuditLog(Base):
     user_agent = Column(String, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
     details = Column(JSON)
+
+
+class DataQualityScore(Base):
+    __tablename__ = "data_quality_scores"
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(10), index=True, nullable=False)
+    score = Column(Float, nullable=False)
+    completeness_pct = Column(Float)
+    staleness_hours = Column(Float)
+    has_gaps = Column(Boolean, default=False)
+    gap_count = Column(Integer, default=0)
+    outlier_count = Column(Integer, default=0)
+    details = Column(JSON)
+    computed_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class MarketRegimeSnapshot(Base):
+    __tablename__ = "market_regime_snapshots"
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(10), index=True, nullable=True)
+    snapshot_date = Column(DateTime, index=True, nullable=False)
+    regime = Column(String(30), nullable=False)
+    vix_level = Column(Float, nullable=True)
+    volatility_20d = Column(Float, nullable=True)
+    trend_signal = Column(Float, nullable=True)
+    metadata = Column(JSON)
+    computed_at = Column(DateTime, default=datetime.utcnow)
+
+
+class WebhookSubscription(Base):
+    __tablename__ = "webhook_subscriptions"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True, nullable=False)
+    url = Column(String(2000), nullable=False)
+    secret = Column(String(64), nullable=True)
+    events = Column(JSON, nullable=False)
+    is_active = Column(Boolean, default=True)
+    last_triggered_at = Column(DateTime, nullable=True)
+    last_status_code = Column(Integer, nullable=True)
+    failure_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ModelDegradationAlert(Base):
+    __tablename__ = "model_degradation_alerts"
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(10), index=True, nullable=False)
+    model_type = Column(String(20), nullable=True)
+    metric_name = Column(String(50), nullable=False)
+    previous_value = Column(Float, nullable=False)
+    current_value = Column(Float, nullable=False)
+    threshold = Column(Float, nullable=False)
+    triggered_at = Column(DateTime, default=datetime.utcnow, index=True)
+    acknowledged = Column(Boolean, default=False)
+    acknowledged_at = Column(DateTime, nullable=True)
+    details = Column(JSON)
+
+
+class PredictionQualityMetric(Base):
+    __tablename__ = "prediction_quality_metrics"
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(10), index=True, nullable=False)
+    horizon_days = Column(Integer, nullable=False)
+    period_start = Column(DateTime, index=True, nullable=False)
+    period_end = Column(DateTime, index=True, nullable=False)
+    sample_count = Column(Integer, nullable=False)
+    mape = Column(Float, nullable=True)
+    mae = Column(Float, nullable=True)
+    direction_hit_rate = Column(Float, nullable=True)
+    vs_naive_improvement = Column(Float, nullable=True)
+    vs_buy_hold_note = Column(String(500), nullable=True)
+    abstention_count = Column(Integer, default=0)
+    computed_at = Column(DateTime, default=datetime.utcnow, index=True)
+
 
 # Create tables
 Base.metadata.create_all(bind=engine)
@@ -425,6 +503,57 @@ async def regenerate_api_key(
     return {"api_key": current_user.api_key}
 
 # ========== PREDICTION ENDPOINTS ==========
+def _predict_with_passport_and_abstention(
+    symbol: str, start: str, end: str, include_uncertainty: bool, model_type: str
+):
+    """Run prediction and return actual, predicted, confidence, passport, abstained, reason."""
+    from predictor import predict, compute_rmse, compute_mape
+    import numpy as np
+    regime_info = {}
+    try:
+        from regime_service import detect_regime
+        regime_info = detect_regime(symbol=symbol)
+    except Exception:
+        pass
+    actual, predicted = predict(
+        symbol, start=start, end=end, use_attention=False
+    )
+    confidence_lower = (predicted * 0.95).tolist() if include_uncertainty else None
+    confidence_upper = (predicted * 1.05).tolist() if include_uncertainty else None
+    if include_uncertainty and len(predicted) > 0:
+        try:
+            import os
+            model_path = os.path.join(settings.MODELS_DIR or "models", f"{symbol}_gru_model.pth")
+            if os.path.exists(model_path):
+                pred_lower = np.percentile(predicted, 2.5)
+                pred_upper = np.percentile(predicted, 97.5)
+                confidence_lower = (np.array(predicted) * 0.98 - (pred_upper - pred_lower) * 0.5).tolist()
+                confidence_upper = (np.array(predicted) * 1.02 + (pred_upper - pred_lower) * 0.5).tolist()
+        except Exception:
+            pass
+    pred_last = float(predicted[-1])
+    conf_width = (confidence_upper[-1] - confidence_lower[-1]) if confidence_lower and confidence_upper else 0
+    abstained = bool(conf_width > pred_last * 0.15)
+    abstention_reason = "low_confidence" if abstained else None
+    passport = {
+        "model_version": "2.0",
+        "model_type": model_type,
+        "feature_set": ["Close", "MA_*", "EMA_*", "RSI", "MACD", "BB_*", "STD_*", "RET_*"],
+        "data_start": start,
+        "data_end": end,
+        "regime": regime_info.get("regime", "unknown"),
+        "vix_level": regime_info.get("vix_level"),
+    }
+    rmse = compute_rmse(actual, predicted)
+    mape = compute_mape(actual, predicted)
+    return {
+        "actual": actual, "predicted": predicted,
+        "confidence_lower": confidence_lower, "confidence_upper": confidence_upper,
+        "passport": passport, "abstained": abstained, "abstention_reason": abstention_reason,
+        "rmse": rmse, "mape": mape, "regime": regime_info.get("regime", "unknown"),
+    }
+
+
 @app.post("/api/v1/predict", response_model=PredictionResponse)
 @limiter.limit(settings.RATE_LIMIT_PER_MINUTE)
 async def predict_stock(
@@ -433,43 +562,42 @@ async def predict_stock(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get stock price prediction with uncertainty"""
+    """Get stock price prediction with uncertainty, data quality gating, and prediction passport."""
+    import json
     cache_key = f"prediction:{request.symbol}:{request.start_date}:{request.end_date}"
-    
-    # Check cache
     cached = await cache_get(cache_key)
     if cached:
         logger.info(f"Cache hit for {request.symbol}")
-        import json
         return json.loads(cached)
-    
+
     try:
-        # Import prediction logic (from your enhanced predictor.py)
-        from predictor import predict, compute_rmse, compute_mape
-        from enhanced_predictor import PredictionWithUncertainty, EnhancedGRUModel
-        import torch
-        
-        # Get predictions
-        actual, predicted = predict(
+        from data_quality_service import is_prediction_allowed
+        allowed, quality_result = is_prediction_allowed(request.symbol)
+        if not allowed:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": "Prediction not available: data quality below threshold",
+                    "data_quality": quality_result,
+                },
+            )
+
+        result = _predict_with_passport_and_abstention(
             request.symbol,
-            start=request.start_date,
-            end=request.end_date,
-            use_attention=False
+            request.start_date,
+            request.end_date,
+            request.include_uncertainty,
+            request.model_type,
         )
-        
-        # Calculate uncertainty if requested
-        confidence_lower, confidence_upper = None, None
-        if request.include_uncertainty:
-            # Load model for uncertainty estimation
-            # This is a simplified version - implement full MC Dropout
-            confidence_lower = (predicted * 0.95).tolist()
-            confidence_upper = (predicted * 1.05).tolist()
-        
-        # Calculate metrics
-        rmse = compute_rmse(actual, predicted)
-        mape = compute_mape(actual, predicted)
-        
-        # Save prediction to database
+        actual = result["actual"]
+        predicted = result["predicted"]
+        confidence_lower = result["confidence_lower"]
+        confidence_upper = result["confidence_upper"]
+        passport = result["passport"]
+        abstained = result["abstained"]
+        abstention_reason = result["abstention_reason"]
+        rmse, mape = result["rmse"], result["mape"]
+
         db_prediction = Prediction(
             user_id=current_user.id,
             symbol=request.symbol,
@@ -477,12 +605,15 @@ async def predict_stock(
             confidence_lower=float(confidence_lower[-1]) if confidence_lower else None,
             confidence_upper=float(confidence_upper[-1]) if confidence_upper else None,
             model_version="2.0",
-            metadata={"rmse": rmse, "mape": mape}
+            metadata={"rmse": rmse, "mape": mape, "regime": result.get("regime")},
+            passport=passport,
+            abstained=abstained,
+            abstention_reason=abstention_reason,
         )
         db.add(db_prediction)
         db.commit()
         db.refresh(db_prediction)
-        
+
         response = {
             "symbol": request.symbol,
             "predicted_prices": predicted.tolist(),
@@ -490,17 +621,35 @@ async def predict_stock(
             "confidence_lower": confidence_lower,
             "confidence_upper": confidence_upper,
             "metrics": {"rmse": rmse, "mape": mape},
-            "prediction_id": db_prediction.id
+            "prediction_id": db_prediction.id,
+            "passport": passport,
+            "abstained": abstained,
+            "abstention_reason": abstention_reason,
         }
-        
-        # Cache response
-        import json
         await cache_set(cache_key, json.dumps(response))
-        
         log_audit(db, current_user.id, "PREDICT", request.symbol, "unknown")
-        
+
+        try:
+            from webhook_service import deliver_webhook
+            for sub in db.query(WebhookSubscription).filter(
+                WebhookSubscription.user_id == current_user.id,
+                WebhookSubscription.is_active == True,
+            ).all():
+                if "prediction_created" in (sub.events or []):
+                    payload = {"event": "prediction_created", "prediction_id": db_prediction.id, "symbol": request.symbol, "predicted_price": float(predicted[-1]), "abstained": abstained}
+                    code, err = deliver_webhook(sub.url, payload, sub.secret)
+                    sub.last_triggered_at = datetime.utcnow()
+                    sub.last_status_code = code
+                    if code >= 400 or code is None:
+                        sub.failure_count = (sub.failure_count or 0) + 1
+                    db.commit()
+        except Exception as e:
+            logger.debug(f"Webhook notify failed: {e}")
+
         return response
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Prediction error for {request.symbol}: {e}")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
@@ -875,14 +1024,344 @@ async def explain_stock_movement(
     if not movement_data:
         raise HTTPException(status_code=404, detail=f"Could not get movement data for {symbol}")
     
-    return {
-        "symbol": movement_data['symbol'],
-        "explanation": movement_data['explanation'],
-        "change_pct": movement_data['change_pct'],
-        "current_price": movement_data['current_price'],
-        "previous_price": movement_data.get('previous_price'),
-        "volume_ratio": movement_data.get('volume_ratio', 1.0)
-    }
+        return {
+            "symbol": movement_data['symbol'],
+            "explanation": movement_data['explanation'],
+            "change_pct": movement_data['change_pct'],
+            "current_price": movement_data['current_price'],
+            "previous_price": movement_data.get('previous_price'),
+            "volume_ratio": movement_data.get('volume_ratio', 1.0)
+        }
+
+# ========== INDUSTRY FEATURES: DATA QUALITY, REGIME, QUALITY REPORT, WEBHOOKS, SCENARIO, VaR ==========
+
+@app.get("/api/v1/data-quality/{symbol}")
+@limiter.limit("30/minute")
+async def get_data_quality(
+    symbol: str,
+    lookback_days: int = 90,
+    current_user: User = Depends(get_current_user),
+):
+    """Get data quality score for a symbol. Predictions are gated when score is below threshold."""
+    try:
+        from data_quality_service import compute_data_quality
+        result = compute_data_quality(symbol.strip().upper(), lookback_days=lookback_days)
+        return result
+    except Exception as e:
+        logger.error(f"Data quality error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/regime")
+@limiter.limit("30/minute")
+async def get_market_regime(
+    symbol: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+):
+    """Get current market regime (low_vol, high_vol, trending_up, trending_down, crisis)."""
+    try:
+        from regime_service import detect_regime
+        result = detect_regime(symbol=symbol)
+        return result
+    except Exception as e:
+        logger.error(f"Regime error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/quality-report")
+@limiter.limit("20/minute")
+async def get_quality_report(
+    symbol: Optional[str] = None,
+    horizon_days: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get prediction quality report: accuracy vs baseline, direction hit rate, by symbol/horizon."""
+    from datetime import timedelta
+    period_end = datetime.utcnow()
+    period_start = period_end - timedelta(days=90)
+    filters = {}
+    if symbol:
+        filters["symbol"] = symbol.upper()
+    if horizon_days is not None:
+        filters["horizon_days"] = horizon_days
+    q = db.query(PredictionQualityMetric).filter(
+        PredictionQualityMetric.period_start >= period_start,
+        PredictionQualityMetric.period_end <= period_end,
+    )
+    for k, v in filters.items():
+        q = q.filter(getattr(PredictionQualityMetric, k) == v)
+    rows = q.order_by(PredictionQualityMetric.computed_at.desc()).limit(50).all()
+    return [
+        {
+            "symbol": r.symbol,
+            "horizon_days": r.horizon_days,
+            "period_start": r.period_start.isoformat() if r.period_start else None,
+            "period_end": r.period_end.isoformat() if r.period_end else None,
+            "sample_count": r.sample_count,
+            "mape": r.mape,
+            "mae": r.mae,
+            "direction_hit_rate": r.direction_hit_rate,
+            "vs_naive_improvement": r.vs_naive_improvement,
+            "vs_buy_hold_note": r.vs_buy_hold_note,
+            "abstention_count": r.abstention_count or 0,
+            "computed_at": r.computed_at.isoformat() if r.computed_at else None,
+        }
+        for r in rows
+    ]
+
+
+@app.post("/api/v1/quality-report/compute")
+@limiter.limit("5/minute")
+async def compute_quality_report(
+    symbol: str,
+    horizon_days: int = 7,
+    current_user: User = Depends(check_subscription("premium")),
+    db: Session = Depends(get_db),
+):
+    """Compute and persist prediction quality metrics for a symbol (Premium)."""
+    from datetime import timedelta
+    from quality_report_service import compute_quality_metrics
+    period_end = datetime.utcnow()
+    period_start = period_end - timedelta(days=90)
+    predictions = db.query(Prediction).filter(
+        Prediction.symbol == symbol.upper(),
+        Prediction.prediction_date >= period_start,
+        Prediction.abstained == False,
+    ).order_by(Prediction.prediction_date).all()
+    if not predictions:
+        raise HTTPException(status_code=404, detail="No predictions found for this symbol in period")
+    actual_list = []
+    predicted_list = []
+    for p in predictions:
+        if p.actual_price is not None and p.predicted_price is not None:
+            actual_list.append(p.actual_price)
+            predicted_list.append(p.predicted_price)
+    abstention_count = db.query(Prediction).filter(
+        Prediction.symbol == symbol.upper(),
+        Prediction.prediction_date >= period_start,
+        Prediction.abstained == True,
+    ).count()
+    metric = compute_quality_metrics(
+        actual_list, predicted_list, symbol.upper(), horizon_days,
+        period_start, period_end, abstention_count=abstention_count,
+    )
+    row = PredictionQualityMetric(
+        symbol=metric["symbol"],
+        horizon_days=metric["horizon_days"],
+        period_start=metric["period_start"],
+        period_end=metric["period_end"],
+        sample_count=metric["sample_count"],
+        mape=metric.get("mape"),
+        mae=metric.get("mae"),
+        direction_hit_rate=metric.get("direction_hit_rate"),
+        vs_naive_improvement=metric.get("vs_naive_improvement"),
+        vs_buy_hold_note=metric.get("vs_buy_hold_note"),
+        abstention_count=metric.get("abstention_count", 0),
+    )
+    db.add(row)
+    db.commit()
+    return {"status": "ok", "metric": metric}
+
+
+class WebhookCreate(BaseModel):
+    url: str = Field(..., min_length=10, max_length=2000)
+    secret: Optional[str] = None
+    events: List[str] = Field(default=["prediction_created"])
+
+
+@app.post("/api/v1/webhooks")
+@limiter.limit("10/minute")
+async def create_webhook(
+    body: WebhookCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Subscribe to webhook events (prediction_created, prediction_updated, alert_triggered)."""
+    sub = WebhookSubscription(
+        user_id=current_user.id,
+        url=body.url,
+        secret=body.secret or "",
+        events=body.events,
+        is_active=True,
+    )
+    db.add(sub)
+    db.commit()
+    db.refresh(sub)
+    return {"id": sub.id, "url": sub.url, "events": sub.events, "is_active": sub.is_active}
+
+
+@app.get("/api/v1/webhooks")
+async def list_webhooks(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List current user's webhook subscriptions."""
+    subs = db.query(WebhookSubscription).filter(WebhookSubscription.user_id == current_user.id).all()
+    return [
+        {"id": s.id, "url": s.url, "events": s.events, "is_active": s.is_active, "last_triggered_at": s.last_triggered_at.isoformat() if s.last_triggered_at else None}
+        for s in subs
+    ]
+
+
+@app.delete("/api/v1/webhooks/{webhook_id}")
+async def delete_webhook(
+    webhook_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete a webhook subscription."""
+    sub = db.query(WebhookSubscription).filter(
+        WebhookSubscription.id == webhook_id,
+        WebhookSubscription.user_id == current_user.id,
+    ).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    sub.is_active = False
+    db.commit()
+    return {"status": "deactivated"}
+
+
+class ScenarioRequest(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=10)
+    scenario: str = Field(default="base", pattern="^(base|high_vol|market_down_5|market_up_2)$")
+    vol_multiplier: Optional[float] = Field(None, ge=0.5, le=3.0)
+    market_shock_pct: Optional[float] = Field(None, ge=-20, le=20)
+
+
+@app.post("/api/v1/predict/scenario")
+@limiter.limit(settings.RATE_LIMIT_PER_MINUTE)
+async def scenario_prediction(
+    request: ScenarioRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Get scenario-adjusted prediction (e.g. high_vol or market shock)."""
+    try:
+        result = _predict_with_passport_and_abstention(
+            request.symbol, "2020-01-01", datetime.utcnow().strftime("%Y-%m-%d"),
+            True, "gru",
+        )
+        base_return = (result["predicted"][-1] / result["actual"][-1] - 1.0) if result["actual"] and result["actual"][-1] else 0.0
+        from scenario_service import scenario_adjust_prediction
+        adj = scenario_adjust_prediction(
+            base_return,
+            request.scenario,
+            vol_multiplier=request.vol_multiplier or 1.5,
+            market_shock_pct=request.market_shock_pct or (-5.0 if request.scenario == "market_down_5" else 2.0),
+        )
+        return {
+            "symbol": request.symbol,
+            "scenario": request.scenario,
+            "base_predicted_return": base_return,
+            "adjusted_return": adj,
+            "base_price": result["predicted"][-1] if result["predicted"] else None,
+            "adjusted_price": result["predicted"][-1] * (1 + adj) if result["predicted"] else None,
+        }
+    except Exception as e:
+        logger.error(f"Scenario prediction error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class PortfolioVaRRequest(BaseModel):
+    symbols: List[str] = Field(..., min_length=1, max_length=20)
+    weights: Optional[List[float]] = None
+    confidence: float = Field(default=0.95, ge=0.9, le=0.99)
+    volatility_scale: float = Field(default=1.5, ge=1.0, le=3.0)
+
+
+@app.post("/api/v1/portfolio/var")
+@limiter.limit("20/minute")
+async def portfolio_var(
+    request: PortfolioVaRRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Estimate portfolio Value-at-Risk using predicted returns and volatility scale."""
+    try:
+        from scenario_service import portfolio_var_from_predictions
+        predicted_returns = []
+        for sym in request.symbols:
+            try:
+                r = _predict_with_passport_and_abstention(sym, "2020-01-01", datetime.utcnow().strftime("%Y-%m-%d"), False, "gru")
+                if r["actual"] and r["predicted"]:
+                    ret = (r["predicted"][-1] / r["actual"][-1] - 1.0)
+                    predicted_returns.append(ret)
+                else:
+                    predicted_returns.append(0.0)
+            except Exception:
+                predicted_returns.append(0.0)
+        if not predicted_returns:
+            predicted_returns = [0.0] * len(request.symbols)
+        out = portfolio_var_from_predictions(
+            request.symbols, predicted_returns,
+            volatility_scale=request.volatility_scale,
+            confidence=request.confidence,
+        )
+        return out
+    except Exception as e:
+        logger.error(f"VaR error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/predict/{prediction_id}/explain")
+@limiter.limit("20/minute")
+async def explain_prediction(
+    prediction_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get feature importance (explainability) for a prediction."""
+    p = db.query(Prediction).filter(
+        Prediction.id == prediction_id,
+        Prediction.user_id == current_user.id,
+    ).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Prediction not found")
+    try:
+        from explainability_service import feature_importance_permutation, explain_prediction as explain_pred
+        import numpy as np
+        feature_names = ["Close", "MA_5", "MA_10", "MA_20", "RSI", "MACD", "BB_Width", "STD_20", "RET_1", "RET_5"]
+        imp = {}
+        try:
+            from predictor import predict
+            actual, predicted = predict(p.symbol, "2020-01-01", datetime.utcnow().strftime("%Y-%m-%d"), use_attention=False)
+            arr = np.array(predicted[-60:], dtype=np.float32) if len(predicted) >= 60 else np.array(predicted, dtype=np.float32)
+            n_f = min(10, len(feature_names))
+            if arr.size >= n_f:
+                X = arr[-n_f:].reshape(1, n_f)
+                def pred_fn(x):
+                    return np.array([float(p.predicted_price)])
+                imp = feature_importance_permutation(pred_fn, X, feature_names[:n_f], n_repeats=2, baseline_pred=float(p.predicted_price))
+            else:
+                imp = {f: 0.0 for f in feature_names[:n_f]}
+        except Exception:
+            imp = {f: 0.0 for f in feature_names[:5]}
+        explanation = explain_pred(imp, top_n=5)
+        return {"prediction_id": prediction_id, "symbol": p.symbol, "feature_importance": imp, "explanation": explanation}
+    except Exception as e:
+        logger.error(f"Explain error: {e}")
+        return {"prediction_id": prediction_id, "symbol": p.symbol, "feature_importance": {}, "explanation": {"summary": "Explanation not available"}, "error": str(e)}
+
+
+@app.get("/api/v1/admin/degradation-alerts")
+async def list_degradation_alerts(
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List model degradation alerts (Admin)."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+    alerts = db.query(ModelDegradationAlert).order_by(ModelDegradationAlert.triggered_at.desc()).limit(limit).all()
+    return [
+        {
+            "id": a.id, "symbol": a.symbol, "metric_name": a.metric_name,
+            "previous_value": a.previous_value, "current_value": a.current_value,
+            "threshold": a.threshold, "triggered_at": a.triggered_at.isoformat() if a.triggered_at else None,
+            "acknowledged": a.acknowledged,
+        }
+        for a in alerts
+    ]
+
 
 # ========== HEALTH CHECK ==========
 @app.get("/health")
