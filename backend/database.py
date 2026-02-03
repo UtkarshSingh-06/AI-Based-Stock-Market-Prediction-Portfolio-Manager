@@ -122,6 +122,12 @@ class Prediction(Base):
     metadata = Column(JSON)
     notes = Column(Text)
     
+    # Prediction passport (compliance / explainability)
+    passport = Column(JSON)  # model_version, feature_set, data_start, data_end, regime
+    # Abstention: when uncertainty or data quality is poor
+    abstained = Column(Boolean, default=False)
+    abstention_reason = Column(String(100), nullable=True)  # low_confidence, low_data_quality
+    
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)
     
@@ -533,6 +539,98 @@ class SMSSubscription(Base):
     # Relationships
     user = relationship("User", back_populates="sms_subscription")
 
+# ========== INDUSTRY FEATURES: DATA QUALITY, REGIME, WEBHOOKS, DEGRADATION ==========
+
+class DataQualityScore(Base):
+    """Per-symbol data quality score for gating predictions"""
+    __tablename__ = "data_quality_scores"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(10), index=True, nullable=False)
+    
+    score = Column(Float, nullable=False)  # 0-100
+    completeness_pct = Column(Float)  # % of expected bars present
+    staleness_hours = Column(Float)  # hours since last data point
+    has_gaps = Column(Boolean, default=False)
+    gap_count = Column(Integer, default=0)
+    outlier_count = Column(Integer, default=0)
+    
+    details = Column(JSON)  # raw checks
+    computed_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+class MarketRegimeSnapshot(Base):
+    """Market regime (volatility/trend) for a date or symbol"""
+    __tablename__ = "market_regime_snapshots"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(10), index=True, nullable=True)  # null = broad market
+    snapshot_date = Column(DateTime, index=True, nullable=False)
+    
+    regime = Column(String(30), nullable=False)  # low_vol, high_vol, trending_up, trending_down, crisis
+    vix_level = Column(Float, nullable=True)
+    volatility_20d = Column(Float, nullable=True)
+    trend_signal = Column(Float, nullable=True)  # e.g. SMA crossover
+    metadata = Column(JSON)
+    computed_at = Column(DateTime, default=datetime.utcnow)
+
+class WebhookSubscription(Base):
+    """User webhooks for prediction/alert events"""
+    __tablename__ = "webhook_subscriptions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    
+    url = Column(Text, nullable=False)
+    secret = Column(String(64))  # for HMAC signing
+    events = Column(JSON, nullable=False)  # ["prediction_created", "prediction_updated", "alert_triggered"]
+    is_active = Column(Boolean, default=True)
+    
+    last_triggered_at = Column(DateTime, nullable=True)
+    last_status_code = Column(Integer, nullable=True)
+    failure_count = Column(Integer, default=0)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class ModelDegradationAlert(Base):
+    """Alerts when model accuracy drops below threshold"""
+    __tablename__ = "model_degradation_alerts"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(10), index=True, nullable=False)
+    model_type = Column(String(20), nullable=True)
+    
+    metric_name = Column(String(50), nullable=False)  # mape, rmse, direction_hit_rate
+    previous_value = Column(Float, nullable=False)
+    current_value = Column(Float, nullable=False)
+    threshold = Column(Float, nullable=False)
+    
+    triggered_at = Column(DateTime, default=datetime.utcnow, index=True)
+    acknowledged = Column(Boolean, default=False)
+    acknowledged_at = Column(DateTime, nullable=True)
+    details = Column(JSON)
+
+class PredictionQualityMetric(Base):
+    """Aggregated prediction vs actual and vs baseline (for Quality Report)"""
+    __tablename__ = "prediction_quality_metrics"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(10), index=True, nullable=False)
+    horizon_days = Column(Integer, nullable=False)  # 1, 7, 30
+    
+    period_start = Column(DateTime, index=True, nullable=False)
+    period_end = Column(DateTime, index=True, nullable=False)
+    
+    sample_count = Column(Integer, nullable=False)
+    mape = Column(Float, nullable=True)
+    mae = Column(Float, nullable=True)
+    direction_hit_rate = Column(Float, nullable=True)  # % correct direction
+    vs_naive_improvement = Column(Float, nullable=True)  # % improvement over naive forecast
+    vs_buy_hold_note = Column(Text, nullable=True)  # e.g. "outperformed in 60% of windows"
+    
+    abstention_count = Column(Integer, default=0)
+    computed_at = Column(DateTime, default=datetime.utcnow, index=True)
+
 # ========== INDEXES ==========
 # Create composite indexes for better query performance
 from sqlalchemy import Index
@@ -542,6 +640,10 @@ Index('idx_predictions_symbol_date', Prediction.symbol, Prediction.prediction_da
 Index('idx_market_data_symbol_date', MarketData.symbol, MarketData.date)
 Index('idx_trades_portfolio_executed', Trade.portfolio_id, Trade.executed_at)
 Index('idx_audit_logs_user_timestamp', AuditLog.user_id, AuditLog.timestamp)
+Index('idx_data_quality_symbol_computed', DataQualityScore.symbol, DataQualityScore.computed_at)
+Index('idx_regime_symbol_date', MarketRegimeSnapshot.symbol, MarketRegimeSnapshot.snapshot_date)
+Index('idx_quality_metrics_symbol_horizon', PredictionQualityMetric.symbol, PredictionQualityMetric.horizon_days)
+Index('idx_degradation_symbol_triggered', ModelDegradationAlert.symbol, ModelDegradationAlert.triggered_at)
 
 # ========== DATABASE INITIALIZATION ==========
 def init_db():
