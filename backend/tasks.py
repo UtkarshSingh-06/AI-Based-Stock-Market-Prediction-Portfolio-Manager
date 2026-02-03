@@ -13,7 +13,7 @@ import yfinance as yf
 
 from database import (
     SessionLocal, User, SMSSubscription, SMSNotification, 
-    StockMovement, Watchlist
+    StockMovement, Watchlist, Prediction, ModelDegradationAlert,
 )
 from sms_service import sms_service
 from stock_explainer import stock_explainer
@@ -56,6 +56,12 @@ def setup_periodic_tasks(sender, **kwargs):
         crontab(hour=0, minute=0),
         reset_daily_notification_counters.s(),
         name='reset-notification-counters'
+    )
+    # Check model degradation daily (e.g. 3 AM UTC)
+    sender.add_periodic_task(
+        crontab(hour=3, minute=0),
+        check_model_degradation.s(),
+        name='check-model-degradation'
     )
 
 # ========== STOCK MONITORING TASKS ==========
@@ -305,3 +311,80 @@ def monitor_single_stock(symbol: str):
     """Monitor a single stock and return movement data"""
     movement_data = stock_explainer.explain_movement(symbol)
     return movement_data
+
+
+# ========== MODEL DEGRADATION ALERTS ==========
+
+def _mape_for_predictions(predictions_list):
+    """Compute MAPE from list of (predicted_price, actual_price)."""
+    if not predictions_list:
+        return None
+    total = 0
+    n = 0
+    for pred, actual in predictions_list:
+        if actual and actual > 0:
+            total += abs(pred - actual) / actual * 100
+            n += 1
+    return total / n if n else None
+
+
+@celery_app.task(name="check_model_degradation")
+def check_model_degradation(symbol: str = None, mape_threshold: float = 15.0):
+    """
+    Compare recent prediction accuracy to previous window; create ModelDegradationAlert if worse.
+    If symbol is None, check all symbols that have recent predictions with actuals.
+    """
+    db = SessionLocal()
+    try:
+        from datetime import timedelta
+        now = datetime.utcnow()
+        recent_end = now - timedelta(days=7)
+        recent_start = now - timedelta(days=14)
+        previous_start = now - timedelta(days=21)
+        q = db.query(Prediction.symbol).filter(
+            Prediction.actual_price.isnot(None),
+            Prediction.prediction_date >= previous_start,
+        ).distinct()
+        if symbol:
+            q = q.filter(Prediction.symbol == symbol)
+        symbols_to_check = [r[0] for r in q.all()]
+        created = 0
+        for sym in symbols_to_check:
+            recent_rows = db.query(Prediction.predicted_price, Prediction.actual_price).filter(
+                Prediction.symbol == sym,
+                Prediction.actual_price.isnot(None),
+                Prediction.actual_price > 0,
+                Prediction.prediction_date >= recent_start,
+                Prediction.prediction_date < recent_end,
+            ).all()
+            previous_rows = db.query(Prediction.predicted_price, Prediction.actual_price).filter(
+                Prediction.symbol == sym,
+                Prediction.actual_price.isnot(None),
+                Prediction.actual_price > 0,
+                Prediction.prediction_date >= previous_start,
+                Prediction.prediction_date < recent_start,
+            ).all()
+            recent_mape = _mape_for_predictions(recent_rows)
+            previous_mape = _mape_for_predictions(previous_rows)
+            if recent_mape is None or previous_mape is None:
+                continue
+            if recent_mape > mape_threshold and recent_mape > previous_mape * 1.2:
+                alert = ModelDegradationAlert(
+                    symbol=sym,
+                    model_type="gru",
+                    metric_name="mape",
+                    previous_value=previous_mape,
+                    current_value=recent_mape,
+                    threshold=mape_threshold,
+                    details={"window": "7d", "previous_window": "7d"},
+                )
+                db.add(alert)
+                created += 1
+        db.commit()
+        return {"status": "success", "alerts_created": created, "symbols_checked": len(symbols_to_check)}
+    except Exception as e:
+        logger.error(f"Model degradation check failed: {e}")
+        db.rollback()
+        return {"status": "error", "error": str(e)}
+    finally:
+        db.close()
