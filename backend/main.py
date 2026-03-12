@@ -115,7 +115,7 @@ class Prediction(Base):
     confidence_upper = Column(Float)
     model_version = Column(String)
     accuracy_score = Column(Float, nullable=True)
-    metadata = Column(JSON)
+    meta = Column("metadata", JSON)
     passport = Column(JSON, nullable=True)  # model_version, feature_set, data_start, data_end, regime
     abstained = Column(Boolean, default=False)
     abstention_reason = Column(String(100), nullable=True)
@@ -170,7 +170,7 @@ class MarketRegimeSnapshot(Base):
     vix_level = Column(Float, nullable=True)
     volatility_20d = Column(Float, nullable=True)
     trend_signal = Column(Float, nullable=True)
-    metadata = Column(JSON)
+    meta = Column("metadata", JSON)
     computed_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -605,7 +605,7 @@ async def predict_stock(
             confidence_lower=float(confidence_lower[-1]) if confidence_lower else None,
             confidence_upper=float(confidence_upper[-1]) if confidence_upper else None,
             model_version="2.0",
-            metadata={"rmse": rmse, "mape": mape, "regime": result.get("regime")},
+            meta={"rmse": rmse, "mape": mape, "regime": result.get("regime")},
             passport=passport,
             abstained=abstained,
             abstention_reason=abstention_reason,
@@ -1262,11 +1262,82 @@ async def scenario_prediction(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class PairsTradingRequest(BaseModel):
+    """Pairs trading backtest: two cointegrated stocks, spread >2 std triggers trade."""
+    symbol1: str = Field(..., min_length=1, max_length=10)
+    symbol2: str = Field(..., min_length=1, max_length=10)
+    threshold_std: float = Field(default=2.0, ge=1.0, le=4.0)
+    lookback_days: int = Field(default=504, ge=100, le=2520)
+
+
+@app.post("/api/v1/pairs/backtest")
+@limiter.limit("10/minute")
+async def pairs_trading_backtest(
+    request: PairsTradingRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Pairs Trading Strategy Backtest.
+    Finds two stocks (same sector), tests cointegration (statsmodels), calculates spread.
+    When spread deviates >2 std: long underperformer, short outperformer. Backtest for profitability.
+    Example pairs: KO & PEP, XOM & CVX.
+    """
+    try:
+        from pairs_trading import backtest_pairs_strategy
+        return backtest_pairs_strategy(
+            symbol1=request.symbol1.strip().upper(),
+            symbol2=request.symbol2.strip().upper(),
+            threshold_std=request.threshold_std,
+            lookback_days=request.lookback_days,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Pairs trading backtest error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class PortfolioVaRRequest(BaseModel):
     symbols: List[str] = Field(..., min_length=1, max_length=20)
     weights: Optional[List[float]] = None
     confidence: float = Field(default=0.95, ge=0.9, le=0.99)
     volatility_scale: float = Field(default=1.5, ge=1.0, le=3.0)
+
+
+class VaRCalculatorRequest(BaseModel):
+    """VaR Calculator: Historical (percentile) vs Parametric (mean/std) comparison."""
+    symbols: List[str] = Field(..., min_length=1, max_length=20)
+    weights: Optional[List[float]] = None
+    confidence: float = Field(default=0.95, ge=0.9, le=0.99)
+    lookback_days: int = Field(default=252, ge=30, le=2520)
+
+
+@app.post("/api/v1/portfolio/var/calculator")
+@limiter.limit("20/minute")
+async def var_calculator_endpoint(
+    request: VaRCalculatorRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Value at Risk (VaR) Calculator.
+    Downloads portfolio historical returns, computes:
+    - Historical VaR: 5th percentile (95% VaR) = loss you won't exceed 95% of the time.
+    - Parametric VaR: Uses mean and std, assumes normal distribution.
+    Returns both and comparison.
+    """
+    try:
+        from var_calculator import var_calculator
+        return var_calculator(
+            symbols=request.symbols,
+            weights=request.weights,
+            confidence=request.confidence,
+            lookback_days=request.lookback_days,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"VaR calculator error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/v1/portfolio/var")
